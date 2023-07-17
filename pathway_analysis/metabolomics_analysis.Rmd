@@ -1,0 +1,399 @@
+---
+title: "metabolomics analysis"
+author: "Duygu Dede Sener, Amaury Pelzer, Denise Slenter"
+date: "2023-06-05"
+output: html_document
+---
+## download and install required packages
+```{r}
+#install.packages('metabolighteR')
+#or we can install it via the following code
+remotes::install_github('aberHRML/metabolighteR')
+library(metabolighteR)
+library(tidyverse)
+library(dplyr)
+library(httr)
+library(stringr)
+if(!"ggplot2" %in% installed.packages()){install.packages("ggplot2")}
+library('ggplot2')
+library(ggrepel)
+library(rJava)
+library(jsonlite)
+library(clusterProfiler)
+#mtbls_key()
+```
+
+## Retrieve the data from Metaboligths data source
+```{r}
+BASE_URL <- "https://www.ebi.ac.uk:443/metabolights/ws"
+study <- 'MTBLS3233' # this study ID can be replaced by the dataset ID captured in Fairspace
+
+#get all available files for the study
+allFiles <- metabolighteR::get_study_files(study, raw_data = FALSE)
+#to get file/files ends with "maf.tsv"
+selectedFiles <- allFiles[grepl("maf.tsv", allFiles$file),]
+
+#the first and second contains same samples but different peak intensity values 
+#for now we will only do analysis for the first profiling file
+query <- paste0(BASE_URL, "/studies/",study,"/download?file=", selectedFiles$file[1])
+metabolites <-  httr::GET (url = query, httr::add_headers(user_token = getOption('MTBLS_API_KEY'))) %>% 
+                    content(as = "text") %>% 
+                    read_delim(delim = "\t") %>% 
+                    as_tibble()
+
+# following is for the second profiling data, uncomment it when needed
+# query2 <- paste0(BASE_URL, "/studies/",study,"/download?file=", selectedFiles$file[2])
+# metabolites2 <-  httr::GET (url = query2, httr::add_headers(user_token = getOption('MTBLS_API_KEY'))) %>%
+#                    content(as = "text") %>%
+#                    read_delim(delim = "\t") %>%
+#                    as_tibble()
+
+#to get metadata
+metaFile <- allFiles [allFiles$type=="metadata_sample",]
+query <- paste0(BASE_URL, "/studies/",study,"/download?file=", metaFile$file)
+metadata <-  httr::GET (url = query, httr::add_headers(user_token = getOption('MTBLS_API_KEY'))) %>% 
+                    content(as = "text") %>% 
+                    read_delim(delim = "\t") %>% 
+                    as_tibble()
+
+```
+
+## Modify the retrieved data (metadata and count data)
+```{r}
+#drop NA values for factor value
+#metadata <- metadata %>% drop_na (`Factor Value[Disease]`, )
+
+#remove NA values from the column containing "Factor" string, since the column "Factor" would be the compared column
+metadata <- metadata %>% filter(rowSums(is.na(.[ , grep("Factor", colnames(.))])) != ncol(.[ , grep("Factor", colnames(.))]))
+
+#take only two columns
+metadata <- metadata[,grepl("Factor", colnames(metadata)) | grepl("Sample Name", colnames(metadata))]
+#metadata <- metadata[ ,c("Factor Value[Disease]", "Sample Name")] # remove disease, check sample name 
+colnames(metadata) <- c("Sample","Factor") 
+
+#filter out columns for metabolites data
+columns <- metabolites %>% dplyr::select(database_identifier,chemical_formula,metabolite_identification)
+
+#take only samples in metabolites occurring in the metadata
+names.use <- names(metabolites)[ names(metabolites) %in% metadata$Sample]
+#update mbx data with used sample names
+metabolites <- metabolites [ ,names.use]
+
+#order data based on column names
+metabolites <- metabolites[ , order(names(metabolites),decreasing=TRUE)]
+#add first selected description columns again
+metabolites <- cbind(columns, metabolites)
+#remove rows containing "unknown" values for database identifier column
+metabolites <- metabolites[!grepl("unknown", metabolites$database_identifier),]
+#remove rows containing NA values for database identifier column
+metabolites <- metabolites %>% drop_na (`database_identifier`, )
+
+#order metadata based on sample name
+metadata <- metadata[ order(metadata$Sample,decreasing=TRUE),]
+
+rm(allFiles,columns,metaFile, selectedFiles, BASE_URL,names.use, query, study)
+```
+
+## Preprocessing metabolomics data before statistical analysis
+```{r}
+#Remove metabolites has NA value for more than 50%
+columns <- ncol(metabolites)
+rows <- nrow(metabolites)
+#detect how many NA values exist per metabolite
+nofNAperMet <- rowSums(is.na(metabolites[,4:columns]))
+#calculate fifty percent of total columns
+fifty_percent <- floor((columns)/2)
+mSet_MissingDataCounted <- cbind(metabolites, nofNAperMet)
+mSet_NoMissingData <- subset(mSet_MissingDataCounted, nofNAperMet <= fifty_percent)
+#Remove last column for further processing.
+mSet_NoMissingData <- subset(mSet_NoMissingData, select=-c(nofNAperMet))
+
+#Convert intensity data to numeric values                         
+mSet_NoMissingData[, c(4:columns)] <- apply(mSet_NoMissingData[, c(4:columns)],2, function(x) as.numeric(as.character(x)))
+transformation <- "log_2" 
+
+if(transformation == "cube_root"){
+    mSet_transformed <-  mSet_NoMissingData[, c(4:columns)]^(1/3)
+}else if(transformation == "square_root"){
+    mSet_transformed <-  mSet_NoMissingData[, c(4:columns)]^(1/2)
+}else if(transformation == "log_2"){
+    mSet_transformed <-  log2(mSet_NoMissingData[, c(4:columns)])
+}else if(transformation == "log_10"){
+    mSet_transformed <- log10(mSet_NoMissingData[, c(4:columns)])
+}else{print("Warning: name for transformation not recognized")}
+
+#add description columns to the transformed data
+mSet_transformed <- cbind(mSet_NoMissingData[,c(1:3)], mSet_transformed)
+
+write.csv(mSet_transformed$database_identifier,"IDs.csv", row.names = FALSE, quote = FALSE)
+```
+
+## Visualize and test whether the transformation is good for the transformed data
+```{r}
+## Visualize the data after the transformation (for one sample to get an idea of suitability of transformation:
+#create histogram for original distribution for first column with data
+hist(mSet_NoMissingData[,4], col='steelblue', main='Original')
+#create histogram for log-transformed distribution 
+hist(mSet_transformed[,4], col='coral2', main=transformation)
+
+## Testing if the transformation creates a normally distributed dataset (alpha >= 0.05)
+##Calculate all Shapiro values for raw and transformed data:
+mSet_NoMissingData_Shapiro <- lapply(mSet_NoMissingData[,c(4:columns)], shapiro.test)
+mSet_transformed_Shapiro <- lapply(mSet_transformed[,c(4:columns)], shapiro.test)
+
+#Obtain the p-values for raw and transformed data
+mSet_NoMissingData_Shapiro_pvalues <- do.call(rbind, mSet_NoMissingData_Shapiro)
+mSet_transformed_Shapiro_pvalues <- do.call(rbind, mSet_transformed_Shapiro)
+
+## Count how often the p-value is above 0.05, to obtain an estimate of achieved normality due to transformation
+mSet_NoMissingData_Shapiro_pvalues_sum <- sum(mSet_NoMissingData_Shapiro_pvalues[,2] >= 0.05, na.rm=TRUE)
+mSet_transformed_Shapiro_pvalues_sum <- sum(mSet_transformed_Shapiro_pvalues[,2] >= 0.05, na.rm=TRUE)
+eighty_percent <- floor(((columns)/10)*8)
+
+#Print relevant information:
+if(mSet_transformed_Shapiro_pvalues_sum[1] > eighty_percent ){paste0("Data after ", transformation ," transformation seems to follow a normal distribution for more then 80% of your data")} else{
+  print("Advised to select a different data transformation procedure")}
+
+remove( mSet_MissingDataCounted, mSet_NoMissingData, mSet_NoMissingData_Shapiro, mSet_NoMissingData_Shapiro_pvalues, mSet_transformed_Shapiro, mSet_transformed_Shapiro_pvalues, eighty_percent, fifty_percent, mSet_NoMissingData_Shapiro_pvalues_sum, mSet_transformed_Shapiro_pvalues_sum)
+
+```
+
+## Statistical analysis
+```{r}
+
+#Create backup of data
+mSet_transformed.b <- mSet_transformed
+mSet_FINAL <- mSet_transformed
+
+#get the first disease 
+factor <- colnames(mSet_FINAL)[c(4:columns)]
+#Find relevant columns per group.
+columns_factor <- sum(str_count(colnames(mSet_FINAL)[c(4:columns)], factor))
+end_factor <- columns_factor
+
+##calculate logFC for 2 groups, ignoring missing values (NAs) when calculating the mean.  
+group1 = apply(mSet_FINAL[,4:end_factor], 1, mean, na.rm=TRUE)
+group2 = apply(mSet_FINAL[,(end_factor+1):ncol(mSet_FINAL)], 1, mean, na.rm=TRUE)
+
+
+          # ###########  DESEQ implementation ###############
+          # sampleLabels<-sampleLabels[, c(2,3)]
+          # sampleLabels$disease <- relevel(factor(sampleLabels$disease),ref="nonIBD")
+          # #add an experimental group variable to sampleLabels
+          # sampleLabels$group <- as.factor(paste(sampleLabels$disease,sampleLabels$biopsy_location,sep="_"))
+          # 
+          # library(DESeq2)
+          # sampleLabels <- metadata$Sample
+          # dds <- DESeq2::DESeqDataSetFromMatrix(countData = data, colData=sampleLabels)
+          # 
+          # library(limma)
+          # results <- limma::voom(counts = mSet_NoMissingData[,4:ncol(mSet_NoMissingData)], design = NULL, lib.size = NULL, normalize.method = "none",
+          #      block = NULL, correlation = NULL, weights = NULL,
+          #      span = 0.5, plot = FALSE, save.plot = FALSE)
+          # 
+          # v <- voom(counts= mSet_NoMissingData[,4:ncol(mSet_NoMissingData)], design, plot=TRUE, normalize="quantile")
+          # 
+          # ##################################################
+
+#once the metabolomics data is log2 transformed, we need to take the difference between the means 
+#(iso dividing the means over one another), since log2 Fold Change or log2 Ratio == log2(condition / control). 
+#Note: if the transformation step applied is cube_root or square_root, one needs to divide control over disease for this step!
+  if(transformation == "log2"){
+    foldchange <-  group1 - group2
+  } else if(transformation == "log10"){
+    foldchange <-  log2((10^group1)/(10^group2))
+  } else {
+    foldchange<- log2(group1 /group2 )
+  }
+
+mSet_AnalysisReady <- cbind(mSet_FINAL, foldchange)
+
+##Calculate p-value for two groups based on t-test
+##general function to store p-values for multiple rows:
+ttest_mSet <- function(df, grp1, grp2) {
+  x = df[grp1]
+  y = df[grp2]
+  x = as.numeric(x)
+  y = as.numeric(y)  
+  results = t.test(x, y)
+  results$p.value
+}
+p_values <- apply(mSet_FINAL, 1, ttest_mSet, grp1 = c(4:end_factor), grp2 = c((end_factor+1):ncol(mSet_FINAL)))
+
+##Add p_values column to analysis dataset:
+mSet_AnalysisReady <- cbind(mSet_AnalysisReady, p_values)
+
+#Convert logFC and p-values columns to numeric values            
+mSet_AnalysisReady <- as.data.frame(mSet_AnalysisReady)
+
+mSet_AnalysisReady[ , c('foldchange','p_values')] <- apply(mSet_AnalysisReady[ , c('foldchange','p_values')], 2, function(x) as.numeric(as.character(x)))
+```
+
+## Volcano Plot to visualize the statistical analysis results 
+```{r}
+
+##Inspired by: https://biocorecrg.github.io/CRG_RIntroduction/volcano-plots.html
+##Define the thresholds for log2 (Fold Change) and p-values
+#For cut-off value uncertainties, see https://doi.org/10.1039/C6AN01342B .
+log2FC_min <- -0.26
+log2FC_max <-  0.26
+p_value_threshold <- 0.05
+
+##Create column with HMDB_IDs, only if the data is relevant
+mSet_AnalysisReady$relevant_labels <- mSet_AnalysisReady$database_identifier
+mSet_AnalysisReady$relevant_labels[!((mSet_AnalysisReady$foldchange <= log2FC_min 
+                                    | mSet_AnalysisReady$foldchange >= log2FC_max) 
+                                    &  mSet_AnalysisReady$p_values <= p_value_threshold)] <- NA
+
+# ##Duplication issues:
+# if(!"dplyr" %in% installed.packages()){install.packages("dplyr")}
+# library(dplyr)
+# library(ggrepel)
+
+##volcanoPlot_Disorder 
+volcanoPlot_disorder <- ggplot(data=mSet_AnalysisReady, aes(x=foldchange, y=-log10(p_values), 
+                                                            label=relevant_labels)) + geom_point() + 
+                                                            theme_minimal() + geom_text_repel()
+
+## Add vertical lines for FoldChange and P-value thresholds:
+volcanoPlot_disorder <- volcanoPlot_disorder + geom_vline(xintercept=c(log2FC_min, log2FC_max), col="blue") +
+    geom_hline(yintercept=-log10(p_value_threshold), col="red") + theme(plot.background = element_rect(fill = "white"))
+
+disorderName <- "Factor"
+
+titleVolcano <- paste0("Volcano plot of ", transformation, " transformed data for ", disorderName )
+verticalAxisTitle <- paste0(transformation, " Fold Change, ", disorderName, " versus control ")
+
+## Add title and update axis labels:
+volcanoPlot_disorder <- volcanoPlot_disorder + ggtitle(titleVolcano) + labs(y = "-log10(p-value)", x = verticalAxisTitle)
+
+# Show the Volcano plot in the notebook output:
+volcanoPlot_disorder
+
+```
+
+
+## Select statistically significant enzymes
+```{r}
+# Select statistically significant enzymes
+sigMets <- mSet_AnalysisReady[which(p_values<0.05),]
+sigMets$pValue <- p_values[which(p_values<0.05)]
+
+```
+
+
+# Get pathway data with compound transformation
+The following Shinyapp was used to map HMDB IDs to KEGG IDs
+https://tabbassidaloii.shinyapps.io/BridgeDb-Shiny/
+
+## BridgeDB identifier mapping
+## it does not work properly need to check again failed to create mapper object!
+```{r}
+##Set the working directory to download the Metabolite mapping file
+location <- "data/metabolites_20220707.bridge"
+checkfile <- paste0(getwd(), '/' ,location)
+
+##Download the Metabolite mapping file (if it doesn't exist locally yet):
+if (!file.exists(checkfile)) {
+download.file(
+  "https://figshare.com/ndownloader/files/26001794",
+  location)
+}
+##Load the metabolite mapping file:
+mapper <- BridgeDbR ::loadDatabase(checkfile)
+#Load the ID mapper:
+mapper <-  BridgeDbR ::loadDatabase(checkfile)
+```
+
+
+#To get mapped file for KEGG compound and CHEBI ids
+```{r}
+# Read KEGG compound to HMDB list
+compound.CHEBI <- read.table(file = "data/XrefBatch_mapping_BridgeDB-Shiny.csv", sep = ',', header = TRUE)
+# Remove ... columns
+compound.CHEBI <- compound.CHEBI[, -c(2,4)]
+# Change column names
+colnames(compound.CHEBI) <- c("database_identifier", "compound")
+
+#remove(mbxCount.log.CD, mbxCount.log.UC, mbxCount.log.nonIBD)
+```
+
+
+## Pathway Analysis
+```{r}
+
+# Merge the KEGG compound to the full metabolomics data
+sigMets <- merge(sigMets, compound.CHEBI, by = "database_identifier", all.x = TRUE)
+#length(which(is.na(deg.CD$compound)))
+# remove NAs for compounds
+sigMets <- sigMets[!is.na(sigMets$compound), ]
+# Relocate the compound column as first
+sigMets <- sigMets %>% relocate(compound)
+
+
+```
+
+
+## Calculate the ORA score for each pathway
+
+
+### ORA score for Ulcerative colitis (UC)
+
+```{r}
+
+# Read JSON file with all the pathways and the compounds within into R object
+PW.to.compound <- fromJSON("data/all_pathways_compounds_dict.json")
+# Read JSON file with all the pathways codes and their names within into R object
+PW.all.names <- fromJSON("data/ec_pathway_names_dict.json")
+
+# Transform PW to compound for further analysis
+PW.to.compound <- as.data.frame(t(as.data.frame(sapply(PW.to.compound, rbind))))
+PW.to.compound$pathway <- rownames(PW.to.compound)
+colnames(PW.to.compound) <- c("compound", "pathway")
+PW.to.compound <- PW.to.compound[,c(2,1)]
+PW.to.compound$pathway <- sub("\\..*", "", PW.to.compound$pathway)
+PW.to.compound$compound <- sub("\\s\\s.*", "", PW.to.compound$compound)
+
+PW.to.name <- data.frame("pathway"=names(PW.all.names), "name"=unlist(PW.all.names))
+
+# Perform Pathway enrichment
+res<- clusterProfiler::enricher(gene=as.factor(unlist(sigMets)),
+                TERM2GENE = PW.to.compound,
+                TERM2NAME = PW.to.name)
+
+as.data.frame(res)
+```
+
+## Plot the results in a horizontal bar chart
+
+```{r}
+# Horizontal bar plot of significant pathways in UC
+res[which(res$p.adjust < 0.05),] %>% 
+  ggplot(aes(reorder(as.character(Description), Count), Count)) + 
+  geom_col(aes(fill = p.adjust)) + 
+  scale_fill_gradient2(low = "#0000ff", 
+                       mid = "#ff0000",
+                       high= "yellow",
+                       midpoint = 0.001) +
+  coord_flip() + 
+  labs(x = "Pathways", y = "Significanlty changed metabolites count")
+```
+## Writing output tables in csv file
+
+```{r}
+# Write the output in a file
+write.table(res, "output/mbxPWdata.csv", sep =",", row.names = FALSE)
+
+```
+
+## Creating jupyter notebook files
+```{r}
+#Jupyter Notebook file
+if(!"devtools" %in% installed.packages()) BiocManager::install("devtools")
+devtools::install_github("mkearney/rmd2jupyter", force=TRUE)
+library(devtools)
+library(rmd2jupyter)
+rmd2jupyter("metabolomics_analysis.Rmd")
+```
+
+

@@ -1,0 +1,261 @@
+---
+title: "Metagenomics_analysis"
+authors: "Duygu Dede Sener, Amaury Pelzer"
+output:
+  html_document:
+    df_print: paged
+---
+
+## Libraries
+
+```{r, message=FALSE, warning=FALSE}
+# Check if libraries are already installed > otherwise install it
+if(!requireNamespace("BiocManager", quietly = TRUE)) install.packages("BiocManager",repos = "http://cran.us.r-project.org")
+if(!"jsonlite" %in% installed.packages()) BiocManager::install("jsonlite")
+if(!"dplyr" %in% installed.packages()) BiocManager::install("dplyr")
+if(!"DESeq2" %in% installed.packages()) BiocManager::install("DESeq2")
+if(!"clusterProfiler" %in% installed.packages()) BiocManager::install("clusterProfiler")
+if(!"ggplot2" %in% installed.packages()) BiocManager::install("ggplot2")
+if(!"VennDiagram" %in% installed.packages()) BiocManager::install("VennDiagram")
+if(!"RColorBrewer" %in% installed.packages()) BiocManager::install("RColorBrewer")
+
+# Load packages
+library(jsonlite)
+library(dplyr)
+library(DESeq2)
+library(clusterProfiler)
+library(ggplot2)
+library(VennDiagram)
+library(RColorBrewer)
+```
+
+
+## Data Preparations
+
+The following section will prepare input data to be used in the analysis
+
+```{r read data,warning=FALSE, message=FALSE}
+
+# Read JSON file with all the pathways and the enzymes within into R object
+PW.all.enz <- fromJSON("data/all_pathways_enzymes_dict.json")
+# Read JSON file with all the pathways codes and their names within into R object
+PW.all.names <- fromJSON("data/ec_pathway_names_dict.json")
+
+# Read  the metagenomics data file
+mgxCount <- read.table(file = 'data/mgxData', sep = '\t', header = TRUE)
+# Read metadata file sample labels
+metaData <- read.table(file = "data/metaData", sep = '\t', stringsAsFactors = TRUE, header = TRUE)
+
+# Turns the first row of mgxData (Gene.Family) into row name
+rownames(mgxCount) <- mgxCount[,1]
+mgxCount <- mgxCount[, -1]
+
+```
+
+## Filtering Steps
+
+We will apply some filtering process to filter out genes in the input data
+
+```{r filtering,warning=FALSE, message=FALSE}
+# Remove genes which has all zero values for all samples then start DE analysis
+mgxCount[is.na(mgxCount)] <- 0
+nonzero <- rowSums(mgxCount) > 0
+mgxCount <- mgxCount[nonzero,]
+
+remove(nonzero)
+```
+
+## T-tests
+
+```{r}
+# Separate CD, UC and nonIBD
+metaData.CD <- metaData[metaData$diagnosis=="CD",]
+metaData.UC <- metaData[metaData$diagnosis=="UC",]
+metaData.nonIBD <- metaData[metaData$diagnosis=="nonIBD",]
+
+# Select metagenomics data from CD, UC and nonIBD
+mgxCount.CD <- subset(mgxCount, select=metaData.CD$External.ID)
+mgxCount.UC <- subset(mgxCount, select=metaData.UC$External.ID)
+mgxCount.nonIBD <- subset(mgxCount, select=metaData.nonIBD$External.ID)
+
+remove(metaData.CD, metaData.UC, metaData.nonIBD, metaData, mgxCount)
+```
+
+### T-tests for Crohn's Disease (CD)
+
+```{r}
+# Compute statistical significance (using t-test)
+pValue.CD = NULL # Empty list for the p-values
+
+for(i in 1 : nrow(mgxCount.nonIBD)) { # For each gene : 
+	x = mgxCount.nonIBD[i,] # control of gene number i
+	y = mgxCount.CD[i,] # CD of gene number i
+	
+	# Compute t-test between the two conditions
+	t = t.test(x, y)
+	
+	# Put the current p-value in the pvalues list
+	pValue.CD[i] = t$p.value
+}
+
+# Apply Benjamini Hochberg correction to pvalues to correct for multiple testing
+pAdjust.CD = p.adjust(pValue.CD, method="BH", n= nrow(mgxCount.nonIBD))
+
+remove(pValue.CD, t, x, y, i)
+```
+
+
+### T-tests for Ulcerative colitis (UC)
+```{r}
+# Compute statistical significance (using t-test)
+pValue.UC = NULL # Empty list for the p-values
+
+for(i in 1 : nrow(mgxCount.nonIBD)) { # For each gene : 
+	x = mgxCount.nonIBD[i,] # control of gene number i
+	y = mgxCount.UC[i,] # UC of gene number i
+	
+	# Compute t-test between the two conditions
+	t = t.test(x, y)
+	
+	# Put the current p-value in the pvalues list
+	pValue.UC[i] = t$p.value
+}
+
+# Apply Benjamini Hochberg correction to pvalues to correct for multiple testing
+pAdjust.UC = p.adjust(pValue.UC, method="BH", n= nrow(mgxCount.nonIBD))
+
+remove(pValue.UC, t, x, y, i)
+```
+
+
+### Select statistically significant enzymes for both CD and UC
+
+```{r}
+# Select statistically significant enzymes
+deg.CD <- mgxCount.CD[which(pAdjust.CD<0.05),]
+deg.CD$pAdjust <- pAdjust.CD[which(pAdjust.CD<0.05)]
+deg.UC <- mgxCount.UC[which(pAdjust.UC<0.05),]
+deg.UC$pAdjust <- pAdjust.UC[which(pAdjust.UC<0.05)]
+
+# Get the row names and split them at the colon
+deg.UC.EC <- row.names(deg.UC)
+deg.UC.EC <- lapply(strsplit(deg.UC.EC, ":"), "[[", 1)
+deg.CD.EC <- row.names(deg.CD)
+deg.CD.EC <- lapply(strsplit(deg.CD.EC, ":"), "[[", 1)
+
+remove(pAdjust.CD, pAdjust.UC)
+```
+
+## Venn diagram for showing the difference between sign. changed enyzmes between CD and UC
+```{r}
+# Prepare a palette of 3 colors with R colorbrewer:
+myCol <- brewer.pal(3, "Pastel2")
+
+# Chart
+venn.diagram(
+        x = list(deg.CD.EC, deg.UC.EC ),
+        category.names = c("CD" , "UC " ),
+        filename = 'CD_UC_venn_diagram.png',
+
+        # Output features
+        imagetype="png" ,
+        height = 680 ,
+        width = 680 ,
+        resolution = 300,
+        compression = "lzw",
+        # 
+        # Circles
+        lwd = 2,
+        lty = 'blank',
+        fill = myCol[1:2],
+
+        # Numbers
+        cex = .6,
+        fontface = "bold",
+        fontfamily = "sans",
+)
+```
+## Calculate the ORA score for each pathway
+
+### ORA score for Crohn's Disease (CD)
+
+```{r}
+deg.nonIBD.EC <- row.names(mgxCount.nonIBD)
+deg.nonIBD.EC <- lapply(strsplit(deg.nonIBD.EC, ":"), "[[", 1)
+
+PW.to.enzyme <- as.data.frame(t(as.data.frame(sapply(PW.all.enz, rbind))))
+PW.to.enzyme$pathway <- rownames(PW.to.enzyme)
+colnames(PW.to.enzyme) <- c("enzyme", "pathway")
+PW.to.enzyme <- PW.to.enzyme[,c(2,1)]
+PW.to.enzyme$pathway <- sub("\\..*", "", PW.to.enzyme$pathway)
+
+PW.to.name <- data.frame("pathway"=names(PW.all.names), "name"=unlist(PW.all.names))
+
+res.CD <- enricher(gene=as.factor(unlist(deg.CD.EC)),
+                TERM2GENE = PW.to.enzyme,
+                TERM2NAME = PW.to.name)
+
+summary(res.CD)
+```
+
+### ORA score for Ulcerative colitis (UC)
+
+```{r}
+res.UC <- enricher(gene=as.factor(unlist(deg.UC.EC)),
+                TERM2GENE = PW.to.enzyme,
+                TERM2NAME = PW.to.name)
+
+summary(res.UC)
+```
+
+## Plot the results in a horizontal bar chart
+
+### Plot for Crohn's Disease (CD)
+
+```{r}
+res.CD[which(res.CD$p.adjust < 0.05),] %>% 
+  ggplot(aes(reorder(as.character(Description), Count), Count)) + 
+  geom_col(aes(fill = p.adjust)) + 
+  scale_fill_gradient2(low = "#0000ff", 
+                       mid = "#ff0000",
+                       high= "yellow",
+                       midpoint = 0.001) +
+  coord_flip() + 
+  labs(x = "Pathways (CD)", y = "Enzyme count")
+```
+
+### Plot for Ulcerative colitis (UC)
+
+```{r}
+# Horizontal bar plot of significant pathways in UC
+res.UC[which(res.UC$p.adjust < 0.05),] %>% 
+  ggplot(aes(reorder(as.character(Description), Count), Count)) + 
+  geom_col(aes(fill = p.adjust)) + 
+  scale_fill_gradient2(low = "#0000ff", 
+                       mid = "#ff0000",
+                       high= "yellow",
+                       midpoint = 0.001) +
+  coord_flip() + 
+  labs(x = "Pathways (UC)", y = "Enzyme count")
+```
+
+## Writing output tables in csv file
+
+```{r}
+# Write the output in a file
+write.table(res.UC, "output/mgxPWdata_UC.csv", sep =",", row.names = FALSE)
+
+# Write the output in a file
+write.table(res.CD, "output/mgxPWdata_CD.csv", sep =",", row.names = FALSE)
+```
+
+## Creating jupyter notebook files
+```{r}
+#Jupyter Notebook file
+if(!"devtools" %in% installed.packages()) BiocManager::install("devtools")
+devtools::install_github("mkearney/rmd2jupyter", force=TRUE)
+library(devtools)
+library(rmd2jupyter)
+rmd2jupyter("metagenomics_analysis.Rmd")
+```
+
